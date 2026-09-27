@@ -58,7 +58,13 @@ try{
  const packaged=join(root,'Independent packaged app.app');
  const resources=copyRuntime(repo,join(packaged,'Contents'));
  mkdirSync(join(resources,'node_modules'),{recursive:true});
- cpSync(join(repo,'node_modules/yaml'),join(resources,'node_modules/yaml'),{recursive:true});
+ // Reproduce the locked production dependency closure without network access.
+ const lock=JSON.parse(readFileSync(join(repo,'package-lock.json'),'utf8'));
+ for(const [path,metadata] of Object.entries(lock.packages)){
+  if(!path.startsWith('node_modules/')||metadata.dev)continue;
+  mkdirSync(dirname(join(resources,path)),{recursive:true});
+  cpSync(join(repo,path),join(resources,path),{recursive:true});
+ }
  const installedConfig={...config,appPath:packaged,voiceMemos:{...config.voiceMemos,helperPath:join(packaged,'Contents/MacOS/voice-memos')}};
  const installedConfigPath=join(support,'packaged-config.json');writeFileSync(installedConfigPath,JSON.stringify(installedConfig));
  for(const command of ['apple-notes-status','voice-memos-status']){

@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "bin": { "apple-to-obsidian": "dist/src/cli.js" },
+  "bin": {
+    "apple-to-obsidian": "dist/src/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:native": "swift build -c release --package-path native --product voice-memos",
@@ -11,7 +13,17 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "verify": "npm test && npm run build:native && scripts/test-voice-memos-native && node scripts/test-install.mjs && node scripts/test-offline.mjs"
   },
-  "engines": { "node": ">=24 <25" },
-  "dependencies": { "yaml": "^2.8.1" },
-  "devDependencies": { "@types/node": "^24.3.0", "typescript": "^5.9.2" }
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "turndown": "7.2.4",
+    "turndown-plugin-gfm": "1.0.2",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/turndown": "5.0.6",
+    "typescript": "^5.9.2"
+  }
 }

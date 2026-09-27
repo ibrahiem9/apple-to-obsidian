@@ -1,58 +1,127 @@
 ObjC.import("Foundation");
 
-function safely(action, fallback) {
-  try { return action(); } catch (_) { return fallback; }
-}
-
+// This script reads Notes through its supported Automation interface. It never
+// opens Apple's private attachment folders and never requests a remote URL.
 function isoDate(value) {
   if (!value) return "";
   const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+  if (Number.isNaN(date.getTime())) throw new Error("invalid-date");
+  return date.toISOString();
+}
+
+function capture(action, fallback, errors, category) {
+  try { return action(); } catch (_) { errors.push(category); return fallback; }
+}
+
+function text(value) { return value === null || value === undefined ? "" : String(value); }
+
+function attachmentURL(attachment) {
+  // JXA uses url for Notes' uppercase URL scripting property. Accommodate
+  // bridges which expose the dictionary spelling without hiding read errors.
+  return text(typeof attachment.url === "function" ? attachment.url() : attachment.URL());
+}
+
+function captureAttachment(app, attachment, directory, noteIndex, index) {
+  const errors = [];
+  const item = {
+    id: capture(() => text(attachment.id()), "", errors, "attachment-id-unavailable"),
+    name: capture(() => text(attachment.name()), "", errors, "attachment-name-unavailable"),
+    contentIdentifier: capture(() => text(attachment.contentIdentifier()), "", errors, "attachment-content-id-unavailable"),
+    url: capture(() => attachmentURL(attachment), "", errors, "attachment-url-unavailable"),
+    createdAt: capture(() => isoDate(attachment.creationDate()), "", errors, "attachment-created-date-unavailable"),
+    modifiedAt: capture(() => isoDate(attachment.modificationDate()), "", errors, "attachment-modified-date-unavailable"),
+    shared: capture(() => Boolean(attachment.shared()), false, errors, "attachment-sharing-unavailable"),
+    contentErrors: errors,
+  };
+  if (!directory) { item.exportError = "attachment-staging-unavailable"; return item; }
+  // No source name or ID is used as a path. Keep a conservative extension so
+  // Obsidian can render saved media, including PDFs and images.
+  const suffix = /\.([a-zA-Z0-9]{1,12})$/.exec(item.name);
+  const filename = `note-${noteIndex}-attachment-${index}${suffix ? `.${suffix[1].toLowerCase()}` : ""}`;
+  const path = `${directory}/${filename}`;
+  try {
+    app.save(attachment, { in: Path(path) });
+    if (!$.NSFileManager.defaultManager.fileExistsAtPath(path)) throw new Error("missing-save-output");
+    item.exportedFile = `attachments/${filename}`;
+  } catch (_) {
+    // A URL card's primary source is its URL; Notes sometimes cannot save its
+    // preview. Preserve the warning separately from a missing binary asset.
+    if (item.url) item.exportWarning = "link-preview-export-unavailable";
+    else item.exportError = "attachment-export-unavailable";
+  }
+  return item;
 }
 
 function run(argv) {
   const inventoryOnly = argv.indexOf("--inventory") >= 0;
+  const directoryArg = argv.indexOf("--attachments-dir");
+  const attachmentsDirectory = directoryArg < 0 ? "" : text(argv[directoryArg + 1]);
+  const limitArg = argv.indexOf("--limit");
+  const limitText = limitArg < 0 ? "" : text(argv[limitArg + 1]);
+  const limit = limitArg < 0 ? undefined : Number(limitText);
   const startedAt = new Date().toISOString();
-  const output = { startedAt, expectedCount: 0, notes: [], errors: [], inventoryOnly };
+  const output = { exportFormatVersion: 2, startedAt, expectedCount: 0, notes: [], errors: [], inventoryOnly };
+  if (limitArg >= 0 && (!/^\d+$/.test(limitText) || !Number.isSafeInteger(limit) || limit < 1)) {
+    output.errors.push("invalid-export-limit");
+    return JSON.stringify(output);
+  }
+  // A limited capture is diagnostic only: retain the full expected count so
+  // the normal importer rejects it rather than treating omitted notes as deleted.
+  if (limit !== undefined) output.exportLimit = limit;
+  if (!inventoryOnly && (!attachmentsDirectory.startsWith("/") || attachmentsDirectory.indexOf("\0") >= 0)) {
+    output.errors.push("attachment-staging-unavailable");
+    return JSON.stringify(output);
+  }
   try {
     const notesApp = Application("Notes");
     const accounts = notesApp.accounts();
     for (const account of accounts) {
-      const accountName = safely(() => String(account.name()), "Unknown account");
+      const accountErrors = [];
+      const accountName = capture(() => text(account.name()), "Unknown account", accountErrors, "account-name-unavailable");
+      const accountId = capture(() => text(account.id()), "", accountErrors, "account-id-unavailable");
       let notes;
-      try {
-        notes = account.notes();
-      } catch (error) {
-        output.errors.push(`Unable to list notes for ${accountName}: ${String(error)}`);
-        continue;
-      }
+      try { notes = account.notes(); }
+      catch (_) { output.errors.push("account-notes-unavailable"); continue; }
       output.expectedCount += notes.length;
       if (inventoryOnly) continue;
       for (let index = 0; index < notes.length; index += 1) {
+        if (limit !== undefined && output.notes.length >= limit) break;
         const note = notes[index];
-        const id = safely(() => String(note.id()), `unreadable:${accountName}:${index}`);
-        const title = safely(() => String(note.name()), "Untitled");
-        const folder = safely(() => String(note.container().name()), "Unknown folder");
-        const locked = safely(() => Boolean(note.passwordProtected()), false);
-        let body = "";
-        let exportError;
-        try { body = String(note.plaintext()); } catch (error) { exportError = String(error); }
-        output.notes.push({
+        const errors = accountErrors.slice();
+        const id = capture(() => text(note.id()), "", errors, "note-id-unavailable");
+        const folderObject = capture(() => note.container(), null, errors, "note-folder-unavailable");
+        const result = {
           id,
-          title,
-          body,
-          modifiedAt: isoDate(safely(() => note.modificationDate(), "")),
-          createdAt: isoDate(safely(() => note.creationDate(), "")),
+          title: capture(() => text(note.name()), "Untitled", errors, "note-title-unavailable"),
+          body: capture(() => text(note.plaintext()), "", errors, "note-plaintext-unavailable"),
+          html: capture(() => text(note.body()), "", errors, "note-html-unavailable"),
+          modifiedAt: capture(() => isoDate(note.modificationDate()), "", errors, "note-modified-date-unavailable"),
+          createdAt: capture(() => isoDate(note.creationDate()), "", errors, "note-created-date-unavailable"),
           account: accountName,
-          folder,
-          hasAttachments: safely(() => note.attachments().length > 0, false),
-          locked,
-          ...(exportError ? { exportError } : {}),
-        });
+          accountId,
+          folder: capture(() => text(folderObject.name()), "Unknown folder", errors, "folder-name-unavailable"),
+          folderId: capture(() => text(folderObject.id()), "", errors, "folder-id-unavailable"),
+          shared: capture(() => Boolean(note.shared()), false, errors, "note-sharing-unavailable"),
+          locked: capture(() => Boolean(note.passwordProtected()), false, errors, "note-lock-status-unavailable"),
+          hasAttachments: false,
+          attachments: [],
+          contentErrors: errors,
+        };
+        let attachments;
+        try { attachments = note.attachments(); result.hasAttachments = attachments.length > 0; }
+        catch (_) {
+          // Unknown is intentionally not treated as an attachment-free note.
+          result.hasAttachments = true;
+          errors.push("note-attachments-unavailable");
+          attachments = [];
+        }
+        for (let attachmentIndex = 0; attachmentIndex < attachments.length; attachmentIndex += 1) {
+          result.attachments.push(captureAttachment(notesApp, attachments[attachmentIndex], attachmentsDirectory, output.notes.length, attachmentIndex));
+        }
+        if (!id || errors.indexOf("note-plaintext-unavailable") >= 0 && errors.indexOf("note-html-unavailable") >= 0) result.exportError = "note-content-unavailable";
+        output.notes.push(result);
       }
     }
-  } catch (error) {
-    output.errors.push(`Notes automation failed: ${String(error)}`);
-  }
+  } catch (_) { output.errors.push("notes-automation-unavailable"); }
   return JSON.stringify(output);
 }

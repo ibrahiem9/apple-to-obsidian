@@ -6,9 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../types.js";
 import { applyAppleNotesExport } from "./apple-notes-export.js";
 
-interface ExportOptions { inventoryOnly: boolean }
+interface ExportOptions { inventoryOnly: boolean; attachmentsDirectory?: string }
 export interface AppleNotesDependencies { exportNotes?: (path: string, options: ExportOptions) => Promise<void> }
-interface Inventory { expectedCount: number; notes: unknown[]; errors: string[]; inventoryOnly?: boolean }
+interface Inventory { expectedCount: number; notes: unknown[]; errors: string[]; inventoryOnly?: boolean; exportLimit?: number }
 export interface AppleNotesSummary {
   lastRun: string;
   expected: number;
@@ -32,11 +32,13 @@ function runDirectory(config: AppConfig): string {
 async function exportNotes(path: string, options: ExportOptions): Promise<void> {
   // In both the checkout and installed app, dist/src/services sits three levels below scripts.
   const script = fileURLToPath(new URL("../../../scripts/export-apple-notes.jxa", import.meta.url));
+  const attachmentsDirectory = options.attachmentsDirectory ?? join(dirname(path), "attachments");
+  if (!options.inventoryOnly) mkdirSync(attachmentsDirectory, { recursive: true, mode: 0o700 });
   const output = openSync(path, "wx", 0o600);
   const stderr = openSync(join(dirname(path), "stderr.log"), "wx", 0o600);
   try {
     await new Promise<void>((resolve, reject) => {
-      const child = spawn("/usr/bin/osascript", ["-l", "JavaScript", script, ...(options.inventoryOnly ? ["--inventory"] : [])], {
+      const child = spawn("/usr/bin/osascript", ["-l", "JavaScript", script, ...(options.inventoryOnly ? ["--inventory"] : ["--attachments-dir", attachmentsDirectory])], {
         stdio: ["ignore", output, stderr],
         // A stuck Automation request must not retain the importer lock indefinitely.
         timeout: 30 * 60 * 1000,
@@ -51,7 +53,7 @@ async function exportNotes(path: string, options: ExportOptions): Promise<void> 
 function inventory(path: string): Inventory {
   const value = JSON.parse(readFileSync(path, "utf8")) as Inventory;
   if (!value || !Number.isSafeInteger(value.expectedCount) || value.expectedCount < 0 || !Array.isArray(value.notes) || !Array.isArray(value.errors)) throw new Error(failureMessage);
-  if (value.errors.length || (!value.inventoryOnly && value.notes.length !== value.expectedCount)) throw new Error(failureMessage);
+  if (value.exportLimit !== undefined || value.errors.length || (!value.inventoryOnly && value.notes.length !== value.expectedCount)) throw new Error(failureMessage);
   return value;
 }
 
@@ -112,7 +114,7 @@ export async function syncAppleNotes(config: AppConfig, options: { scheduled?: b
     if (options.scheduled && !options.dryRun && get(db, "scheduledDay") === day) return { ...summary, skipped: 1 };
     directory = runDirectory(config);
     const path = join(directory, "payload.json");
-    await (dependencies.exportNotes ?? exportNotes)(path, { inventoryOnly: options.dryRun ?? false });
+    await (dependencies.exportNotes ?? exportNotes)(path, { inventoryOnly: options.dryRun ?? false, attachmentsDirectory: join(directory, "attachments") });
     const data = inventory(path);
     summary.expected = data.expectedCount;
     if (options.dryRun) return summary;

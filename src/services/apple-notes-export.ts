@@ -1,22 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { AppConfig } from "../types.js";
 import { atomicWrite, markdown, readMarkdown, safeFilename, sha256 } from "../files.js";
 
-interface ExportedAppleNote {
-  id: string;
-  title: string;
-  body: string;
-  modifiedAt: string;
-  createdAt?: string;
-  account?: string;
-  folder?: string;
-  hasAttachments: boolean;
-  locked: boolean;
-  exportError?: string;
-}
+import { publishAppleNoteArtifact, renderRichNote, type RichAppleNote } from "./apple-notes-rich.js";
+
+type ExportedAppleNote = RichAppleNote;
 
 interface AppleNotesPayload {
+  exportFormatVersion?: number;
+  exportLimit?: number;
+  inventoryOnly?: boolean;
   startedAt: string;
   expectedCount: number;
   notes: ExportedAppleNote[];
@@ -25,7 +19,12 @@ interface AppleNotesPayload {
 
 export function applyAppleNotesExport(config: AppConfig, payloadPath: string): { expected: number; exported: number; updated: number; unchanged: number; retainedDeleted: number; retainedDuplicates: number; failed: number; manifestPath: string } {
   const payload = JSON.parse(requireFile(payloadPath)) as AppleNotesPayload;
-  if (!Array.isArray(payload.notes) || !Array.isArray(payload.errors) || typeof payload.expectedCount !== "number") throw new Error("Malformed Apple Notes export payload");
+  if (!Array.isArray(payload.notes) || !Array.isArray(payload.errors) || !Number.isSafeInteger(payload.expectedCount) || payload.expectedCount < 0) throw new Error("Malformed Apple Notes export payload");
+  if (payload.exportLimit !== undefined) throw new Error("Diagnostic limited exports cannot publish into a vault");
+  if (payload.inventoryOnly) throw new Error("Inventory-only exports cannot publish into a vault");
+  if (payload.exportFormatVersion !== undefined && payload.exportFormatVersion !== 2) throw new Error("Unsupported Apple Notes export format");
+  const identifiers = payload.notes.map(note => note.id).filter(Boolean);
+  if (new Set(identifiers).size !== identifiers.length) throw new Error("Duplicate Apple Notes source IDs in export");
   const destination = join(config.vaultPath, config.appleNotesPath);
   const existing = mapExistingFiles(destination);
   const existingById = existing.byId;
@@ -41,33 +40,73 @@ export function applyAppleNotesExport(config: AppConfig, payloadPath: string): {
       seenIds.add(note.id);
       const flags: string[] = ["local-only"];
       if (note.locked) flags.push("locked");
-      if (note.exportError) {
-        flags.push("export-error");
-        failures.push({ id: note.id, error: "Unable to read note plaintext" });
-        // Retain the last successful copy when Notes cannot return its body.
-        if (existingById.has(note.id)) continue;
-      }
       if (/recently deleted|deleted/i.test(note.folder ?? "")) flags.push("deleted");
       const meaningfulBody = note.body.replace(/\uFFFC/g, "").trim();
       if (!meaningfulBody) flags.push(note.hasAttachments ? "attachment-only" : "blank");
-      const hash = sha256(note.body);
       const suffix = sha256(note.id).slice(0, 8);
       const path = existingById.get(note.id) ?? join(destination, `${safeFilename(note.title)}--${suffix}.md`);
+      const rich = payload.exportFormatVersion === 2 || note.hasAttachments || /\uFFFC/.test(note.body)
+        ? renderRichNote(note, payloadPath, config) : undefined;
+      const errors = [...(rich?.errors ?? []), ...(note.exportError ? ["note-content-unavailable"] : [])];
+      if (errors.length) {
+        flags.push("incomplete-content", "export-error");
+        failures.push({ id: note.id, error: "Note content or attachments could not be completely exported" });
+        // Never replace a richer prior copy with a thinner or incomplete export.
+        if (existsSync(path)) continue;
+      }
       const properties: Record<string, unknown> = {
         source: "apple-notes", local_only: true, apple_note_id: note.id, apple_modified_iso: note.modifiedAt,
         apple_account: note.account ?? null, apple_folder: note.folder ?? null,
-        has_attachments: note.hasAttachments, content_hash: hash, source_flags: flags,
+        has_attachments: note.hasAttachments, content_hash: rich?.contentHash ?? sha256(note.body), source_flags: flags,
+        ...(rich?.properties ?? {}),
+        apple_export_format_version: rich ? 2 : 1,
+        apple_content_complete: errors.length === 0,
       };
       if (note.createdAt) properties["apple_created_iso"] = note.createdAt;
-      if (note.exportError) properties["export_error"] = note.exportError;
-      const content = markdown(properties, `# ${note.title || "Untitled"}\n\n${note.body}`);
+      if (errors.length) properties["export_errors"] = errors;
+      let body = rich?.body ?? note.body;
+      if (!body.startsWith(`# ${note.title}\n`)) body = `# ${note.title || "Untitled"}\n\n${body}`;
+      if (errors.length) body = `> Import incomplete: some content or attachments could not be exported. The source remains in Apple Notes.\n\n${body}`;
+      const preserved = new Set<string>();
+      if (existsSync(path)) {
+        const previous = readMarkdown(path);
+        for (const value of Array.isArray(previous.properties["apple_preserved_copies"]) ? previous.properties["apple_preserved_copies"] : []) {
+          if (typeof value === "string") preserved.add(value);
+        }
+        const baseChanged = previous.properties["content_hash"] !== properties["content_hash"] || previous.properties["apple_export_format_version"] !== properties["apple_export_format_version"];
+        const { apple_export_content_hash: previousExportHash, ...previousMetadata } = previous.properties;
+        const wasEdited = typeof previousExportHash === "string"
+          ? previousExportHash !== sha256(markdown(previousMetadata, previous.body))
+          : previous.properties["apple_export_body_hash"] !== sha256(previous.body.trim());
+        // Preserve legacy/backfilled copies and externally edited content before
+        // a complete rich export replaces them. Normal generated updates stay lean.
+        if (rich && (wasEdited || (baseChanged && previous.properties["apple_export_format_version"] !== 2))) {
+          const { apple_note_id: _id, ...metadata } = previous.properties;
+          // Generated local assets remain clickable from the Preserved subfolder.
+          // Retain the original Markdown too, including arbitrary user link syntax.
+          const original = publishAppleNoteArtifact(config, "Sources", Buffer.from(requireFile(path)), ".md.txt");
+          const backupBody = previous.body.replace(/\]\(<((?:Sources|Attachments)\/[a-f0-9]{64}\.[a-z0-9.]+)>\)/g, "](<../$1>)");
+          const backup = markdown({ ...metadata, kind: "apple-notes-preserved", local_only: true, apple_original_note_id: note.id,
+            apple_original_path: relative(config.vaultPath, path), apple_original_markdown: original.vaultPath,
+            source_flags: ["local-only", "preserved-export"] }, backupBody);
+          const snapshot = publishAppleNoteArtifact(config, "Preserved", Buffer.from(backup), ".md");
+          preserved.add(snapshot.vaultPath);
+        }
+      }
+      if (preserved.size) {
+        properties["apple_preserved_copies"] = [...preserved].sort();
+        body += `\n\n## Preserved earlier copies\n\n${[...preserved].sort().map(value => `- [[${value.replace(/\.md$/, "")}]]`).join("\n")}`;
+      }
+      properties["apple_export_body_hash"] = sha256(body.trim());
+      properties["apple_export_content_hash"] = sha256(markdown(properties, body));
+      const content = markdown(properties, body);
       if (existsSync(path) && requireFile(path) === content) unchanged += 1;
       else { atomicWrite(path, content); updated += 1; }
     } catch (error) {
       failures.push({ id: note.id || "unknown", error: error instanceof Error ? error.message : String(error) });
     }
   }
-  if (payload.errors.length === 0 && payload.notes.length === payload.expectedCount) {
+  if (failures.length === 0 && payload.notes.length === payload.expectedCount) {
     for (const [id, path] of existingById) {
       if (seenIds.has(id)) continue;
       try {
