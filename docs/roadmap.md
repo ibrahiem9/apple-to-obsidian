@@ -14,4 +14,4 @@ Acceptance for future implementation:
 - Measure accuracy against local human references and record only aggregate results in development logs; retain all personal audio/text locally.
 - Keep offline processing, bounded memory, preserved audio, and explicit review flags.
 
-The GitHub tracking issue is linked here after repository creation.
+Track this feature in [GitHub issue #1](https://github.com/ibrahiem9/apple-to-obsidian/issues/1).
