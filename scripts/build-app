@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {mkdirSync, mkdtempSync, lstatSync, renameSync, rmSync, writeFileSync, existsSync} from 'node:fs';
+import {basename, dirname, join, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {copyRuntime} from './app-lib.mjs';
+process.umask(0o077);
+let staging;
+const repo=dirname(dirname(fileURLToPath(import.meta.url)));
+const args=process.argv.slice(2);
+const i=args.indexOf('--output');
+const output=i<0?join(repo,'.build','Apple to Obsidian.app'):args[i+1];
+function run(bin,args,opts={}){execFileSync(bin,args,{cwd:repo,stdio:'inherit',...opts});}
+try {
+  if(!output||output.startsWith('--'))throw new Error('--output requires a destination ending in .app');
+  const app=resolve(output);
+  if(!basename(app).endsWith('.app')||app===repo)throw new Error('App destination must end in .app');
+  if(existsSync(app)&&(!lstatSync(app).isDirectory()||lstatSync(app).isSymbolicLink()))throw new Error('Existing app destination must be a regular directory.');
+  if(process.platform!=='darwin'||process.arch!=='arm64'||Number(process.versions.node.split('.')[0])!==24) throw new Error('Use native arm64 Node.js 24 on an Apple Silicon Mac.');
+  run('npm',['run','build']);
+  run('swift',['build','-c','release','--package-path',join(repo,'native'),'--product','voice-memos']);
+  mkdirSync(dirname(app),{recursive:true});
+  staging=mkdtempSync(join(dirname(app),'.apple-to-obsidian-build-'));
+  const next=join(staging,'Apple to Obsidian.app');
+  const contents=join(next,'Contents');
+  const resources=copyRuntime(repo,contents);
+  run('npm',['ci','--omit=dev','--ignore-scripts','--no-audit','--no-fund'],{cwd:resources});
+  writeFileSync(join(contents,'Info.plist'),`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>org.appletoobsidian.bridge</string>
+<key>CFBundleName</key><string>Apple to Obsidian</string>
+<key>CFBundleExecutable</key><string>voice-memos</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>NSAppleEventsUsageDescription</key><string>Export your Apple Notes locally to your selected Obsidian vault.</string>
+</dict></plist>\n`);
+  run('/usr/bin/codesign',['--force','--sign',process.env.APPLE_TO_OBSIDIAN_SIGN_IDENTITY??'-','--identifier','org.appletoobsidian.bridge','--requirements','=designated => identifier "org.appletoobsidian.bridge"',next]);
+  run('/usr/bin/codesign',['--verify','--strict',next]);
+  const backup=join(staging,'previous.app');
+  if(existsSync(app)) renameSync(app,backup);
+  try{renameSync(next,app);}catch(error){if(existsSync(backup))renameSync(backup,app);throw error;}
+  rmSync(staging,{recursive:true,force:true});
+  console.log(`Built ${app}`);
+}catch(error){if(staging&&!existsSync(join(staging,'previous.app')))rmSync(staging,{recursive:true,force:true});console.error(`Build: ${error.message}`);process.exitCode=1;}

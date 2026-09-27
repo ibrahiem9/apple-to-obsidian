@@ -1,0 +1,37 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {existsSync,mkdirSync,statSync} from 'node:fs';
+import {dirname,join,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+process.umask(0o077);
+const repo=dirname(dirname(fileURLToPath(import.meta.url)));
+const args=process.argv.slice(2);
+const option=name=>{const i=args.indexOf(name);if(i<0)return undefined;if(!args[i+1]||args[i+1].startsWith('--'))throw new Error(`${name} requires a value`);return args[i+1];};
+try {
+  if(process.platform!=='darwin'||process.arch!=='arm64'||Number(process.versions.node.split('.')[0])!==24)throw new Error('Install native arm64 Node.js 24 on an Apple Silicon Mac.');
+  const os=execFileSync('/usr/bin/sw_vers',['-productVersion'],{encoding:'utf8'}).trim();
+  if(Number(os.split('.')[0])<26)throw new Error('macOS 26 or later is required.');
+  for(const [binary,argv,hint] of [['swift',['--version'],'Install an Xcode toolchain providing Swift 6.2 or later.'],['cmake',['--version'],'Install CMake and make it available in PATH.']])try{execFileSync(binary,argv,{stdio:'ignore'});}catch{throw new Error(hint);}
+  const vault=option('--vault');
+  if(!vault)throw new Error('Usage: scripts/setup --vault PATH [--support-path PATH] [--app-path PATH]');
+  const vaultPath=resolve(vault);
+  if(!existsSync(vaultPath)||!statSync(vaultPath).isDirectory())throw new Error('The selected Obsidian vault must already exist.');
+  execFileSync('npm',['ci','--ignore-scripts','--no-audit','--no-fund'],{cwd:repo,stdio:'inherit'});
+  execFileSync('npm',['run','build'],{cwd:repo,stdio:'inherit'});
+  const {defaultConfig,defaultSupportPath,loadConfig}=await import('../dist/src/config.js');
+  const {atomicWrite}=await import('../dist/src/files.js');
+  const support=resolve(option('--support-path')??defaultSupportPath());
+  mkdirSync(support,{recursive:true,mode:0o700});
+  const configPath=join(support,'config.json');
+  const config=existsSync(configPath)?loadConfig(configPath):defaultConfig(vaultPath,support);
+  if(config.vaultPath!==vaultPath)throw new Error('Existing configuration uses a different vault. Choose its vault or a separate --support-path.');
+  if(option('--app-path'))config.appPath=resolve(option('--app-path'));
+  config.nodePath=process.execPath;
+  config.voiceMemos.helperPath=join(config.appPath,'Contents/MacOS/voice-memos');
+  execFileSync(process.execPath,[join(repo,'scripts/build-app'),'--output',config.appPath],{cwd:repo,stdio:'inherit'});
+  execFileSync(join(repo,'scripts/setup-voice-whisper'),[],{cwd:repo,stdio:'inherit',env:{...process.env,APPLE_TO_OBSIDIAN_WHISPER_DIR:join(support,'whisper')}});
+  atomicWrite(configPath,JSON.stringify(config,null,2)+'\n');
+  execFileSync(process.execPath,[join(repo,'scripts/install-launchd'),'--config',configPath],{cwd:repo,stdio:'inherit'});
+  console.log(`Use --config ${JSON.stringify(configPath)} for installation and run commands on this device.`);
+  console.log('Setup complete; jobs are staged and disabled. Grant Full Disk Access to Apple to Obsidian.app, then run scripts/install-launchd --check-access all. Allow Notes Automation when prompted. Review a short single-language pilot before enabling Voice Memos.');
+}catch(error){console.error(`Setup: ${error.message}`);process.exitCode=1;}

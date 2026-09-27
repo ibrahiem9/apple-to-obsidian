@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {copyFileSync,existsSync,mkdirSync,readFileSync,renameSync,writeFileSync} from 'node:fs';
+import {dirname,join,resolve} from 'node:path';
+import {homedir} from 'node:os';
+import {randomUUID} from 'node:crypto';
+import {loadConfig,defaultConfigPath} from '../dist/src/config.js';
+import {labels,program,plist,fingerprint,jobState,requireAccess,requirePilot,disableJob,enableJob} from './launchd-lib.mjs';
+process.umask(0o077);
+const args=process.argv.slice(2);
+function option(name){const i=args.indexOf(name);if(i<0)return undefined;if(!args[i+1]||args[i+1].startsWith('--'))throw new Error(`${name} requires a value`);return args[i+1];}
+function read(path){try{return JSON.parse(readFileSync(path,'utf8'));}catch{return undefined;}}
+function save(path,value){writeFileSync(path+'.new',JSON.stringify(value,null,2)+'\n',{mode:0o600});renameSync(path+'.new',path);}
+function run(argv,quiet=false){return execFileSync('/bin/launchctl',argv,{encoding:'utf8',stdio:quiet?['ignore','pipe','ignore']:['ignore','pipe','pipe']});}
+const domain=`gui/${process.getuid()}`;
+function bootout(label){try{run(['bootout',`${domain}/${label}`],true);}catch{}}
+function status(label){try{return run(['print',`${domain}/${label}`],true);}catch{return undefined;}}
+async function wait(label,timeout){const start=Date.now();let reported=start;while(Date.now()-start<timeout){const output=status(label);const state=output?jobState(output):'waiting';if(typeof state==='number'){if(state!==0)throw new Error(`The launchd job failed (exit ${state}); inspect its local error log.`);return;}if(Date.now()-reported>30000){console.log('Waiting for the local launchd job to finish…');reported=Date.now();}await new Promise(resolve=>setTimeout(resolve,1000));}throw new Error('The launchd job has not completed yet; inspect --status and local logs.');}
+try{
+ const configPath=resolve(option('--config')??defaultConfigPath()),config=loadConfig(configPath);
+ const support=dirname(configPath),staged=join(support,'launchd-staged'),logs=join(support,'logs');
+ const installed=join(homedir(),'Library/LaunchAgents');
+ const modes=['--enable','--disable','--status','--check-access','--pilot','--review-voice-pilot'].filter(x=>args.includes(x));
+ if(modes.length>1)throw new Error('Choose one operation at a time.');
+ const mode=modes[0];
+ let sources=['notes','voice-memos'];
+ if(['--enable','--disable','--check-access'].includes(mode)){const selected=option(mode);if(!['all','notes','voice-memos'].includes(selected))throw new Error(`${mode} requires notes, voice-memos, or all`);sources=selected==='all'?sources:[selected];}
+ if(mode==='--pilot'||mode==='--review-voice-pilot')sources=['voice-memos'];
+ mkdirSync(staged,{recursive:true,mode:0o700});mkdirSync(logs,{recursive:true,mode:0o700});
+ // Validate every selected source before enabling either one.
+ if(mode==='--enable')for(const source of sources){
+  const key=fingerprint(config,source),label=labels[source];
+  requireAccess(read(join(staged,label+'.access.json')),key);
+  if(source==='voice-memos')requirePilot(read(join(staged,label+'.pilot.json')),key,args.includes('--accept-single-language-limitations'));
+ }
+ for(const source of sources){
+  const label=labels[source],path=join(staged,label+'.plist'),accessPath=join(staged,label+'.access.json'),pilotPath=join(staged,label+'.pilot.json');
+  if(mode==='--status'){const text=status(label);console.log(`${source}: ${text?(/state = running/.test(text)?'running':'loaded'):'not loaded'}; logs: ${logs}`);continue;}
+  if(mode==='--disable'){disableJob(argv=>run(argv,true),domain,label);console.log(`${source} disabled; imported content and history retained.`);continue;}
+  writeFileSync(path,plist(config,configPath,source,logs),{mode:0o600});execFileSync('/usr/bin/plutil',['-lint',path],{stdio:'ignore'});
+  if(!mode){console.log(`Staged ${source}; nothing enabled.`);continue;}
+  const key=fingerprint(config,source);
+  if(mode==='--check-access'||mode==='--pilot'){
+   const pilot=mode==='--pilot',job=`${label}.${pilot?'pilot':'access-check'}`,jobPath=join(staged,job+'.plist');
+   const running=status(job);if(running&&jobState(running)==='running')throw new Error('An earlier check or pilot is still running.');
+   if(pilot)requireAccess(read(accessPath),key);
+   const limit=Number(option('--limit')??1);if(pilot&&(!Number.isInteger(limit)||limit<1||limit>10))throw new Error('--limit must be an integer from 1 through 10.');
+   const resultPath=join(staged,`pilot-result-${randomUUID()}.json`);
+   const commandArgs=program(config,configPath,source,pilot?['--limit',String(limit),'--receipt',resultPath]:[]);
+   if(!pilot)commandArgs[commandArgs.length-1]=source==='notes'?'apple-notes-check':'voice-memos-check';
+   writeFileSync(jobPath,plist(config,configPath,source,logs,{label:job,commandArgs,schedule:false}),{mode:0o600});
+   save(pilot?pilotPath:accessPath,{success:false,fingerprint:key,submittedAt:new Date().toISOString()});
+   bootout(job);run(['bootstrap',domain,jobPath]);await wait(job,pilot?12*60*60*1000:60000);
+   if(fingerprint(config,source)!==key)throw new Error('App or configuration changed during verification; repeat it.');
+   if(pilot){const receipt=read(resultPath);if(!receipt||receipt.success!==true||receipt.imported<1||receipt.failures!==0)throw new Error('Pilot must import at least one recording without failures. Add a short single-language memo and retry.');save(pilotPath,{...receipt,fingerprint:key,reviewed:false});console.log('Pilot imported. Listen to the audio and transcript in Obsidian; if acceptable, run --review-voice-pilot.');}
+   else{save(accessPath,{success:true,fingerprint:key,completedAt:new Date().toISOString()});console.log(`${source}: access verified through launchd.`);}
+  }else if(mode==='--review-voice-pilot'){
+   const receipt=read(pilotPath);if(!receipt||receipt.success!==true||receipt.imported<1||receipt.failures!==0||receipt.fingerprint!==key)throw new Error('A successful current pilot is required first.');
+   save(pilotPath,{...receipt,reviewed:true,reviewedAt:new Date().toISOString()});console.log('Recorded your listening acceptance. Nightly imports remain unchanged.');
+  }else if(mode==='--enable'){
+   requireAccess(read(accessPath),key);if(source==='voice-memos')requirePilot(read(pilotPath),key,args.includes('--accept-single-language-limitations'));
+   mkdirSync(installed,{recursive:true});copyFileSync(path,join(installed,label+'.plist'));enableJob(argv=>run(argv),domain,label,join(installed,label+'.plist'));console.log(`${source} enabled with local nightly schedule and login/wake catch-up.`);
+  }
+ }
+}catch(error){console.error(`Scheduling: ${error.message}`);process.exitCode=1;}

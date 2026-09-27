@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { loadConfig, defaultConfigPath } from '../dist/src/config.js';
+const args = process.argv.slice(2);
+try {
+  const index = args.indexOf('--config');
+  const path = index < 0 ? defaultConfigPath() : args[index + 1];
+  if (!path || path.startsWith('--')) throw new Error('--config requires a path.');
+  if (index >= 0) args.splice(index, 2);
+  const config = loadConfig(path);
+  if (!args.length || args.includes('--help')) {
+    console.log('scripts/run [--config FILE] apple-notes-check|apple-notes-sync|apple-notes-status|voice-memos-check|voice-memos-sync|voice-memos-status [options]');
+  } else {
+    const cli = join(config.appPath, 'Contents', 'Resources', 'dist', 'src', 'cli.js');
+    const child = spawn(config.voiceMemos.helperPath, ['run', '--node', config.nodePath, '--cli', cli, '--config', resolve(path), ...args], {stdio:'inherit'});
+    child.once('error', () => { console.error('Installed app could not start; run setup or check the local configuration.'); process.exitCode = 1; });
+    child.once('exit', code => { process.exitCode = code ?? 1; });
+  }
+} catch (error) { console.error(error.message); process.exitCode = 1; }

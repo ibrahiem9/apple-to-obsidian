@@ -1,0 +1,58 @@
+ObjC.import("Foundation");
+
+function safely(action, fallback) {
+  try { return action(); } catch (_) { return fallback; }
+}
+
+function isoDate(value) {
+  if (!value) return "";
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+}
+
+function run(argv) {
+  const inventoryOnly = argv.indexOf("--inventory") >= 0;
+  const startedAt = new Date().toISOString();
+  const output = { startedAt, expectedCount: 0, notes: [], errors: [], inventoryOnly };
+  try {
+    const notesApp = Application("Notes");
+    const accounts = notesApp.accounts();
+    for (const account of accounts) {
+      const accountName = safely(() => String(account.name()), "Unknown account");
+      let notes;
+      try {
+        notes = account.notes();
+      } catch (error) {
+        output.errors.push(`Unable to list notes for ${accountName}: ${String(error)}`);
+        continue;
+      }
+      output.expectedCount += notes.length;
+      if (inventoryOnly) continue;
+      for (let index = 0; index < notes.length; index += 1) {
+        const note = notes[index];
+        const id = safely(() => String(note.id()), `unreadable:${accountName}:${index}`);
+        const title = safely(() => String(note.name()), "Untitled");
+        const folder = safely(() => String(note.container().name()), "Unknown folder");
+        const locked = safely(() => Boolean(note.passwordProtected()), false);
+        let body = "";
+        let exportError;
+        try { body = String(note.plaintext()); } catch (error) { exportError = String(error); }
+        output.notes.push({
+          id,
+          title,
+          body,
+          modifiedAt: isoDate(safely(() => note.modificationDate(), "")),
+          createdAt: isoDate(safely(() => note.creationDate(), "")),
+          account: accountName,
+          folder,
+          hasAttachments: safely(() => note.attachments().length > 0, false),
+          locked,
+          ...(exportError ? { exportError } : {}),
+        });
+      }
+    }
+  } catch (error) {
+    output.errors.push(`Notes automation failed: ${String(error)}`);
+  }
+  return JSON.stringify(output);
+}

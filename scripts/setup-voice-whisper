@@ -1,0 +1,39 @@
+#!/bin/zsh
+# Explicit online setup only. Never call from an importer or LaunchAgent.
+set -euo pipefail
+umask 077
+WHISPER_ROOT="${APPLE_TO_OBSIDIAN_WHISPER_DIR:-$HOME/Library/Application Support/apple-to-obsidian/whisper}"
+COMMIT=2eeeba56e9edd762b4b38467bab96c2517163158
+SOURCE_SHA256=089b898aa83b24a8321e0fd554eeb0967fb03dd687e27f6374c72d3363b5b429
+MODEL_REVISION=5359861c739e955e79d9a303bcbc70fb988958b1
+MODEL_SHA256=64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2
+command -v cmake >/dev/null || { echo 'CMake is required. Run with a local CMake installation or: uv run --with cmake==4.4.3 scripts/setup-voice-whisper' >&2; exit 1; }
+mkdir -p "$WHISPER_ROOT/downloads" "$WHISPER_ROOT/models" "$WHISPER_ROOT/bin"
+verify() { [[ "$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}')" == "$2" ]]; }
+download() {
+  local target="$1" url="$2" checksum="$3"
+  if [[ -f "$target" ]] && verify "$target" "$checksum"; then return; fi
+  /usr/bin/curl --fail --location --retry 3 --continue-at - --output "$target.partial" "$url"
+  verify "$target.partial" "$checksum" || { echo "Checksum mismatch: $target.partial (retained for inspection)" >&2; exit 1; }
+  /bin/mv "$target.partial" "$target"
+}
+download "$WHISPER_ROOT/downloads/whisper-$COMMIT.tar.gz" "https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/$COMMIT" "$SOURCE_SHA256"
+SOURCE="$WHISPER_ROOT/source-$COMMIT"
+if [[ ! -d "$SOURCE" ]]; then
+  STAGE="$(mktemp -d "$WHISPER_ROOT/source-stage.XXXXXX")"
+  /usr/bin/tar -xzf "$WHISPER_ROOT/downloads/whisper-$COMMIT.tar.gz" --strip-components=1 -C "$STAGE"
+  /bin/mv "$STAGE" "$SOURCE"
+fi
+cmake -S "$SOURCE" -B "$WHISPER_ROOT/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_CURL=OFF
+cmake --build "$WHISPER_ROOT/build" --config Release --target whisper-cli -j 4
+/usr/bin/install -m 0755 "$WHISPER_ROOT/build/bin/whisper-cli" "$WHISPER_ROOT/bin/whisper-cli.new"
+/bin/mv "$WHISPER_ROOT/bin/whisper-cli.new" "$WHISPER_ROOT/bin/whisper-cli"
+download "$WHISPER_ROOT/models/ggml-large-v3.bin" "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_REVISION/ggml-large-v3.bin" "$MODEL_SHA256"
+RUNTIME_SHA256="$(/usr/bin/shasum -a 256 "$WHISPER_ROOT/bin/whisper-cli" | /usr/bin/awk '{print $1}')"
+cat > "$WHISPER_ROOT/manifest.json.new" <<EOF
+{"runtime":"whisper.cpp","version":"v1.8.3","commit":"$COMMIT","sourceArchiveSha256":"$SOURCE_SHA256","binarySha256":"$RUNTIME_SHA256","model":"large-v3","quantized":false,"modelRevision":"$MODEL_REVISION","modelSha256":"$MODEL_SHA256","metal":true}
+EOF
+/bin/mv "$WHISPER_ROOT/manifest.json.new" "$WHISPER_ROOT/manifest.json"
+echo "Verified local runtime: $WHISPER_ROOT/bin/whisper-cli"
+echo "Verified unquantized model: $WHISPER_ROOT/models/ggml-large-v3.bin"
+echo 'Setup complete. Scheduled transcription does not use this script or download files.'

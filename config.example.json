@@ -1,0 +1,12 @@
+{
+  "vaultPath": "~/Documents/Obsidian Vault",
+  "appleNotesPath": "Notes/Apple Notes",
+  "appleNotes": { "nightlyHour": 2 },
+  "voiceMemos": {
+    "outputPath": "Notes/Voice Memos",
+    "segmentSeconds": 30,
+    "segmentation": "single-language",
+    "language": "auto",
+    "nightlyHour": 3
+  }
+}
