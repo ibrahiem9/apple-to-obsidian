@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {findings} from './public-policy.mjs';
+const check=(path,text='synthetic')=>findings(path,Buffer.from(text));
+for(const path of ['config.json','nested/.env.local','library/CloudRecordings.db','recording.m4a','reports/review.md','logs/debug.txt','dist/src/cli.js'])assert.ok(check(path).length,path);
+assert.ok(check('README.md','/Users/'+'realperson/vault').includes('absolute home path'));
+const sentinel='/Users/'+'private/vault';
+assert.deepEqual(check('test/apple-notes.test.ts',sentinel),[]);
+assert.ok(check('test/other.test.ts',sentinel).length);
+assert.ok(check('test/apple-notes.test.ts',sentinel+' /home/'+'someone/data').length);
+assert.deepEqual(check('config.example.json'),[]);
+assert.ok(findings('source.ts',Buffer.from([0])).includes('binary file'));
+console.log('Public policy rejects private files, paths, and binary data; the synthetic exception is exact.');

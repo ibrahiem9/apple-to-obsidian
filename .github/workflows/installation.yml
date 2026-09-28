@@ -1,0 +1,22 @@
+name: Clean installation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Record and check toolchain
+        run: node scripts/check-toolchain.mjs
+      - run: npm run audit:public
+      - name: Real setup twice with pinned Whisper downloads
+        run: npm run verify:install

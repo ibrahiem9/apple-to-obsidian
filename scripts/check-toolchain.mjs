@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
+import {appendFileSync} from 'node:fs';
+assert.equal(process.platform,'darwin');assert.equal(process.arch,'arm64');
+assert.equal(Number(process.versions.node.split('.')[0]),24);
+const run=(cmd,args)=>execFileSync(cmd,args,{encoding:'utf8'}).trim();
+const os=run('/usr/bin/sw_vers',['-productVersion']),swift=run('swift',['--version']),cmake=run('cmake',['--version']);
+assert.ok(Number(os.split('.')[0])>=26);
+const match=swift.match(/Swift version (\d+)\.(\d+)/);
+assert.ok(match&&(Number(match[1])>6||Number(match[1])===6&&Number(match[2])>=2),'Swift 6.2+ required');
+const record=`Commit: ${run('git',['rev-parse','HEAD'])}\nRunner: ${process.env.RUNNER_OS??'local'} ${process.arch}; image ${process.env.ImageOS??'local'} ${process.env.ImageVersion??''}\nmacOS ${os}\nNode ${process.version}\n${swift}\n${cmake.split('\n')[0]}\n`;
+console.log(record);
+if(process.env.GITHUB_STEP_SUMMARY)appendFileSync(process.env.GITHUB_STEP_SUMMARY,'```text\n'+record+'```\n');
